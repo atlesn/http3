@@ -1,0 +1,11 @@
+Requirements:
+- OpenSSL with QUIC      https://github.com/quictls/openssl
+- ngtcp2 with OpenSSL    https://github.com/ngtcp2/ngtcp2
+- nghttp3                https://github.com/ngtcp2/nghttp3
+- libevent
+
+Build:
+- ./compile.sh
+
+Run client:
+- ./main
