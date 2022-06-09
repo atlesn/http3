@@ -15,6 +15,7 @@
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
 #include <ngtcp2/ngtcp2_crypto_openssl.h>
+#include <nghttp3/nghttp3.h>
 
 #define QUIC_CIPHERS  \
     "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_CCM_SHA256"
@@ -24,19 +25,15 @@
 
 #define H3_ALPN_H3_29 "\x5h3-29"
 #define H3_ALPN_H3 "\x2h3"
-#define MYDATA_BUF_SIZE 4096
 #define KEEP_ALIVE_S 10
 #define PONG_TIMEOUT_S (KEEP_ALIVE_S * 2)
 #define HANDSHAKE_TIMEOUT_S 1
 
-struct my_ngtcp2_stream {
-	int64_t id;
-	const uint8_t *data;
-	size_t bytes_total;
-	size_t bytes_written;
-};
+typedef int (*my_ngtcp2_cb_ready)(void *arg);
+typedef int (*my_ngtcp2_cb_get_data)(int64_t *stream_id, ngtcp2_vec *vec, size_t *vec_count, int *fin, void *arg);
+typedef int (*my_ngtcp2_cb_ack_data)(int64_t stream_id, size_t bytes, void *arg);
 
-struct my_ngtcp2 {
+struct my_ngtcp2_ctx {
 	ngtcp2_conn *conn;
 	ngtcp2_crypto_conn_ref conn_ref;
 	ngtcp2_path path;
@@ -56,7 +53,15 @@ struct my_ngtcp2 {
 	struct event *event_timeout;
 	int event_ret;
 	int handshake_complete;
-	struct my_ngtcp2_stream stream;
+	my_ngtcp2_cb_ready cb_ready;
+	my_ngtcp2_cb_get_data cb_get_data;
+	my_ngtcp2_cb_ack_data cb_ack_data;
+	void *cb_arg;
+};
+
+struct my_nghttp3_ctx {
+	nghttp3_conn *conn;
+	int64_t stream_id;
 };
 
 void my_random(void *target, size_t bytes) {
@@ -136,13 +141,18 @@ int my_ngtcp2_cb_acked_stream_data_offset (
 		void *user_data,
 		void *stream_user_data
 ) {
+	struct my_ngtcp2_ctx *ctx = user_data;
+
 	(void)(conn);
-	(void)(stream_id);
 	(void)(offset);
-	(void)(user_data);
 	(void)(stream_user_data);
 
-	printf("Acked: %llu\n", (unsigned long long) datalen);
+	printf("Acked: Stream %lli, %llu bytes \n", (long long int) stream_id, (unsigned long long) datalen);
+
+	if (ctx->cb_ack_data(stream_id, datalen, ctx->cb_arg) != 0) {
+//		ngtcp2_connection_close_error_set_application_error();
+		return NGTCP2_ERR_CALLBACK_FAILURE;
+	}
 
 	// nghttp3_conn_add_ack_offset(m stream_id, datalen);
 	// NGTCP2_ERR_CALLBACK_FAILURE / ngtcp2_conection_close_error_set_application_error
@@ -177,10 +187,18 @@ int my_ngtcp2_cb_extend_max_local_streams_bidi (
 		uint64_t max_streams,
 		void *user_data
 ) {
+	struct my_ngtcp2_ctx *ctx = user_data;
+
 	(void)(conn);
-	(void)(user_data);
 
 	printf("Extend max streams: %llu\n", (unsigned long long) max_streams);
+
+	if (ctx->cb_ready != NULL && ctx->cb_ready(ctx->cb_arg) != 0) {
+		return 1;
+	}
+
+	// Call only once
+	ctx->cb_ready = NULL;
 
 	return 0;
 }
@@ -280,35 +298,27 @@ int my_ngtcp2_cb_initial (
 	return ngtcp2_crypto_client_initial_cb(conn, user_data);
 }
 
-size_t my_ngtcp2_get_message (
-		struct my_ngtcp2 *ctx,
+int my_ngtcp2_get_message (
+		struct my_ngtcp2_ctx *ctx,
 		int64_t *stream_id,
-		int *fin,
 		ngtcp2_vec *data_vector,
-		size_t data_vector_count
+		size_t *data_vector_count,
+		int *fin
 ) {
-	*stream_id = -1;
-	*fin = 0;
-	data_vector->base = 0;
-	data_vector->len = 0;
+	int ret = 0;
 
-	assert(data_vector_count == 1);
-
-	if (ctx->stream.id != -1 && ctx->stream.bytes_written < ctx->stream.bytes_total) {
-		*stream_id = ctx->stream.id;
-		*fin = 1;
-		data_vector->base =
-			(uint8_t *) ctx->stream.data + // Cast away const OK
-			ctx->stream.bytes_written
-		;
-		data_vector->len =
-			ctx->stream.bytes_total -
-			ctx->stream.bytes_written
-		;
-		return 1;
+	if ((ctx->cb_get_data (
+			stream_id,
+			data_vector,
+			data_vector_count,
+			fin,
+			ctx->cb_arg
+	)) != 0) {
+		goto out;
 	}
 
-	return 0;
+	out:
+		return ret;
 }
 
 int my_ngtcp2_send_packet (
@@ -340,7 +350,7 @@ int my_ngtcp2_send_packet (
 }
 
 void event_read (evutil_socket_t fd, short e, void *a) {
-	struct my_ngtcp2 *ctx = a;
+	struct my_ngtcp2_ctx *ctx = a;
 
 	(void)(e);
 
@@ -439,7 +449,7 @@ void event_read (evutil_socket_t fd, short e, void *a) {
 }
 
 void event_timeout (evutil_socket_t fd, short e, void *a) {
-	struct my_ngtcp2 *ctx = a;
+	struct my_ngtcp2_ctx *ctx = a;
 
 	(void)(fd);
 	(void)(e);
@@ -451,50 +461,58 @@ void event_timeout (evutil_socket_t fd, short e, void *a) {
 }
 
 void event_write (evutil_socket_t fd, short e, void *a) {
-	struct my_ngtcp2 *ctx = a;
+	struct my_ngtcp2_ctx *ctx = a;
 
 	(void)(e);
 
 	char buf[1280];
-	int64_t stream_id = 0;
-	int fin = 0;
 	ngtcp2_vec data_vector = {0};
 	ngtcp2_path_storage path_storage;
 	ngtcp2_pkt_info packet_info = {0};
-	size_t data_vector_count = 0;
+	int fin = 0;
 	int flags = 0;
-	ngtcp2_ssize write_bytes = 0;
-	ngtcp2_ssize write_count = 0;
+	ngtcp2_ssize bytes_from_src = 0;
+	ngtcp2_ssize bytes_to_buf = 0;
 	uint64_t timestamp = 0;
+	int64_t stream_id = -1;
+	size_t data_vector_count = 1;
 
 	ngtcp2_path_storage_zero(&path_storage);
 
 	printf("Write event\n");
+
+	if (my_ngtcp2_get_message (
+				ctx,
+				&stream_id,
+				&data_vector,
+				&data_vector_count,
+				&fin
+				) != 0) {
+		goto out_failure;
+	}
 
 	for (;;) {
 		if (my_timestamp_nano(&timestamp) != 0) {
 			goto out_failure;
 		}
 
-		data_vector_count = my_ngtcp2_get_message (
-				ctx,
-				&stream_id,
-				&fin,
-				&data_vector,
-				1
+		printf("Vector count %llu stream ID %lli fin %i data %p len %llu\n",
+				(unsigned long long) data_vector_count,
+				(long long int) stream_id,
+				fin,
+				data_vector.base,
+				(unsigned long long) data_vector.len
 		);
-
-		printf("Write count %llu stream ID %lli fin %i data %p len %llu\n", (unsigned long long) data_vector_count, (long long int) stream_id, fin, data_vector.base, (unsigned long long) data_vector.len);
 
 		flags = NGTCP2_WRITE_STREAM_FLAG_MORE | (fin ? NGTCP2_WRITE_STREAM_FLAG_FIN : 0);
 
-		write_count = ngtcp2_conn_writev_stream (
+		bytes_to_buf = ngtcp2_conn_writev_stream (
 				ctx->conn,
 				&path_storage.path,
 				&packet_info,
 				(uint8_t *) buf,
 				sizeof(buf),
-				&write_bytes,
+				&bytes_from_src,
 				flags,
 				stream_id,
 				&data_vector,
@@ -502,31 +520,38 @@ void event_write (evutil_socket_t fd, short e, void *a) {
 				timestamp
 		);
 
-		if (write_count < 0) {
-			if (write_count == NGTCP2_ERR_WRITE_MORE) {
-				ctx->stream.bytes_written += (size_t) write_bytes;
-				continue;
+		printf("Write count: %li, Write bytes: %li\n", bytes_to_buf, bytes_from_src);
+
+		if (bytes_to_buf < 0) {
+			if (bytes_to_buf == NGTCP2_ERR_WRITE_MORE) {
+				// Must call writev repeatedly until complete.
 			}
 			else {
-				printf("Error while writing: %s\n", ngtcp2_strerror((int) write_count));
+				printf("Error while writing: %s\n", ngtcp2_strerror((int) bytes_to_buf));
 				goto out_failure;
 			}
 		}
-		else if (write_count == 0) {
+		else if (bytes_to_buf == 0) {
 			event_del(ctx->event_write);
 			break;
 		}
 
-		if (write_bytes > 0) {
-			ctx->stream.bytes_written += (size_t) write_bytes;
+		if (bytes_from_src > 0) {
+			assert((size_t) bytes_from_src <= data_vector.len);
+			data_vector.base += (size_t) bytes_from_src;
+			data_vector.len -= (size_t) bytes_from_src;
 		}
 
-		if (my_ngtcp2_send_packet (
-				fd,
-				(const struct sockaddr *) &ctx->addr_remote,
-				ctx->addr_local_len,
-				(const uint8_t *) buf,
-				write_count
+		if (data_vector.len == 0) {
+			stream_id = -1;
+		}
+
+		if (bytes_to_buf > 0 && my_ngtcp2_send_packet (
+					fd,
+					(const struct sockaddr *) &ctx->addr_remote,
+					ctx->addr_local_len,
+					(const uint8_t *) buf,
+					bytes_to_buf
 		) != 0) {
 			goto out_failure;
 		}
@@ -543,25 +568,33 @@ void event_write (evutil_socket_t fd, short e, void *a) {
 static ngtcp2_conn *my_ngtcp2_get_conn (
 		ngtcp2_crypto_conn_ref *ngtcp2_ref
 ) {
-	struct my_ngtcp2 *ctx = ngtcp2_ref->user_data;
+	struct my_ngtcp2_ctx *ctx = ngtcp2_ref->user_data;
 	return ctx->conn;
 }
 
 int my_ngtcp2_ctx_init (
-		struct my_ngtcp2 *ctx,
+		struct my_ngtcp2_ctx *ctx,
 		const struct sockaddr *addr_remote,
 		const socklen_t addr_remote_len,
 		const struct sockaddr *addr_local,
 		const socklen_t addr_local_len,
-		int fd
+		int fd,
+		my_ngtcp2_cb_ready cb_ready,
+		my_ngtcp2_cb_get_data cb_get_data,
+		my_ngtcp2_cb_ack_data cb_ack_data,
+		void *cb_arg
 ) {
 	int ret = 0;
 
 	memset(ctx, 0, sizeof(*ctx));
 
-	ctx->stream.id = -1;
 	ctx->conn_ref.get_conn = my_ngtcp2_get_conn;
 	ctx->conn_ref.user_data = ctx;
+
+	ctx->cb_ready = cb_ready;
+	ctx->cb_get_data = cb_get_data;
+	ctx->cb_ack_data = cb_ack_data;
+	ctx->cb_arg = cb_arg;
 
 	assert(sizeof(ctx->addr_remote) >= addr_remote_len);
 	assert(sizeof(ctx->addr_local) >= addr_local_len);
@@ -750,7 +783,7 @@ int my_ngtcp2_ctx_init (
 		return ret;
 }
 
-void my_ngtcp2_ctx_cleanup(struct my_ngtcp2 *ctx) {
+void my_ngtcp2_ctx_cleanup(struct my_ngtcp2_ctx *ctx) {
 	ngtcp2_conn_del(ctx->conn);
 	SSL_free(ctx->ssl);
 	SSL_CTX_free(ctx->sslctx);
@@ -760,13 +793,341 @@ void my_ngtcp2_ctx_cleanup(struct my_ngtcp2 *ctx) {
 	event_base_free(ctx->event);
 }
 
+int my_nghttp3_cb_acked_stream_data (
+		nghttp3_conn *conn,
+		int64_t stream_id,
+		uint64_t datalen,
+		void *conn_user_data,
+		void *stream_user_data
+) {
+	(void)(conn);
+	(void)(stream_id);
+	(void)(datalen);
+	(void)(conn_user_data);
+	(void)(stream_user_data);
+	return 0;
+}
+
+int my_nghttp3_cb_stream_close (
+		nghttp3_conn *conn,
+		int64_t stream_id,
+		uint64_t app_error_code,
+		void *conn_user_data,
+		void *stream_user_data
+) {
+	(void)(conn);
+	(void)(stream_id);
+	(void)(app_error_code);
+	(void)(conn_user_data);
+	(void)(stream_user_data);
+	return 0;
+}
+
+int my_nghttp3_cb_recv_data (
+		nghttp3_conn *conn,
+		int64_t stream_id,
+		const uint8_t *data,
+		size_t datalen,
+		void *conn_user_data,
+		void *stream_user_data
+) {
+	(void)(conn);
+	(void)(stream_id);
+	(void)(data);
+	(void)(datalen);
+	(void)(conn_user_data);
+	(void)(stream_user_data);
+	return 0;
+}
+
+int my_nghttp3_cb_deferred_consume (
+		nghttp3_conn *conn,
+		int64_t stream_id,
+		size_t consumed,
+		void *conn_user_data,
+		void *stream_user_data
+) {
+	(void)(conn);
+	(void)(stream_id);
+	(void)(consumed);
+	(void)(conn_user_data);
+	(void)(stream_user_data);
+	return 0;
+}
+
+int my_nghttp3_cb_recv_header (
+		nghttp3_conn *conn,
+		int64_t stream_id,
+		int32_t token,
+		nghttp3_rcbuf *name,
+		nghttp3_rcbuf *value,
+		uint8_t flags,
+		void *conn_user_data,
+		void *stream_user_data
+) {
+	(void)(conn);
+	(void)(stream_id);
+	(void)(token);
+	(void)(name);
+	(void)(value);
+	(void)(flags);
+	(void)(conn_user_data);
+	(void)(stream_user_data);
+	return 0;
+}
+
+int my_nghttp3_cb_stop_sending (
+		nghttp3_conn *conn,
+		int64_t stream_id,
+		uint64_t app_error_code,
+		void *conn_user_data,
+		void *stream_user_data
+) {
+	(void)(conn);
+	(void)(stream_id);
+	(void)(app_error_code);
+	(void)(conn_user_data);
+	(void)(stream_user_data);
+	return 0;
+}
+
+int my_nghttp3_cb_reset_stream (
+		nghttp3_conn *conn,
+		int64_t stream_id,
+		uint64_t app_error_code,
+		void *conn_user_data,
+		void *stream_user_data
+) {
+	(void)(conn);
+	(void)(stream_id);
+	(void)(app_error_code);
+	(void)(conn_user_data);
+	(void)(stream_user_data);
+	return 0;
+}
+
+int my_nghttp3_ctx_init (
+		struct my_nghttp3_ctx *ctx
+) {
+	int ret = 0;
+
+	memset(ctx, '\0', sizeof(*ctx));
+
+	static nghttp3_callbacks callbacks = {
+		my_nghttp3_cb_acked_stream_data,
+		my_nghttp3_cb_stream_close,
+		my_nghttp3_cb_recv_data,
+		my_nghttp3_cb_deferred_consume,
+		NULL, /* begin_headers */
+		my_nghttp3_cb_recv_header,
+		NULL, /* end_headers */
+		NULL, /* begin_trailers */
+		NULL, /* recv_trailer */
+		NULL, /* end_trailers */
+		my_nghttp3_cb_stop_sending,
+		NULL, /* end_stream */
+		my_nghttp3_cb_reset_stream,
+		NULL, /* shutdown */
+	};
+
+	nghttp3_settings settings = {0};
+	nghttp3_settings_default(&settings);
+
+	if (nghttp3_conn_client_new (
+			&ctx->conn,
+			&callbacks,
+			&settings,
+			nghttp3_mem_default(),
+			ctx
+	) != 0) {
+		printf("Failed to create http3 client\n");
+		ret = 1;
+		goto out;
+	}
+
+	out:
+	return ret;
+}
+
+void my_nghttp3_ctx_cleanup (
+		struct my_nghttp3_ctx *ctx
+) {
+	nghttp3_conn_del(ctx->conn);
+}
+
+struct my_wrap_data {
+	struct my_ngtcp2_ctx *ngtcp2_ctx;
+	struct my_nghttp3_ctx *nghttp3_ctx;
+};
+
+int my_wrap_submit_request (
+		int64_t *result,
+		struct my_wrap_data *data,
+		const char *endpoint
+) {
+	int ret = 0;
+	int ret_tmp;
+
+	*result = 0;
+
+	int64_t stream_id;
+	if ((ret_tmp = ngtcp2_conn_open_bidi_stream(data->ngtcp2_ctx->conn, &stream_id, NULL)) != 0) {
+		printf("Could not open bidi stream: %s\n", ngtcp2_strerror(ret_tmp));
+		ret = 1;
+		goto out;
+	}
+
+	nghttp3_nv nv[3] = {0};
+
+	// Note : Cast away const
+
+	nv[0].name = (uint8_t *) ":method";
+	nv[0].namelen = strlen(":method");
+	nv[0].value = (uint8_t *) "GET";
+	nv[0].valuelen = strlen("GET");
+
+	nv[1].name = (uint8_t *) ":scheme";
+	nv[1].namelen = strlen(":scheme");
+	nv[1].value = (uint8_t *) "HTTPS";
+	nv[1].valuelen = strlen("HTTPS");
+
+	nv[2].name = (uint8_t *) ":path";
+	nv[2].namelen = strlen(":path");
+	nv[2].value = (uint8_t *) endpoint;
+	nv[2].valuelen = strlen(endpoint);
+
+	if ((ret_tmp = nghttp3_conn_submit_request (data->nghttp3_ctx->conn, stream_id, nv, 3, NULL, data)) != 0) {
+		printf("Failed to submit HTTP3 request: %s\n", nghttp3_strerror(ret_tmp));
+		ret = 1;
+		goto out;
+	}
+
+	*result = stream_id;
+
+	out:
+	return ret;
+}
+
+int my_wrap_cb_ready (void *arg) {
+	struct my_wrap_data *data = arg;
+
+	int64_t ctrl_stream_id;
+	int64_t qpack_enc_stream_id;
+	int64_t qpack_dec_stream_id;
+	int64_t request_stream_id;
+
+	int ret = 0;
+	int ret_tmp;
+
+	printf("Connection ready\n");
+
+	if ((ret_tmp = ngtcp2_conn_open_uni_stream(data->ngtcp2_ctx->conn, &ctrl_stream_id, NULL)) != 0) {
+		printf("Failed to create control stream: %s\n", ngtcp2_strerror(ret_tmp));
+		ret = 1;
+		goto out;
+	}
+
+	if ((ret_tmp = ngtcp2_conn_open_uni_stream(data->ngtcp2_ctx->conn, &qpack_enc_stream_id, NULL)) != 0) {
+		printf("Failed to create qpack encode stream: %s\n", ngtcp2_strerror(ret_tmp));
+		ret = 1;
+		goto out;
+	}
+
+	if ((ret_tmp = ngtcp2_conn_open_uni_stream(data->ngtcp2_ctx->conn, &qpack_dec_stream_id, NULL)) != 0) {
+		printf("Failed to create qpack decode stream: %s\n", ngtcp2_strerror(ret_tmp));
+		ret = 1;
+		goto out;
+	}
+
+	if ((ret_tmp = nghttp3_conn_bind_control_stream(data->nghttp3_ctx->conn, ctrl_stream_id)) != 0) {
+		printf("Failed to bind control stream: %s\n", nghttp3_strerror(ret_tmp));
+		ret = 1;
+		goto out;
+	}
+
+	if ((ret_tmp = nghttp3_conn_bind_qpack_streams(data->nghttp3_ctx->conn, qpack_enc_stream_id, qpack_dec_stream_id)) != 0) {
+		printf("Failed to bind qpack streams: %s\n", nghttp3_strerror(ret_tmp));
+		ret = 1;
+		goto out;
+	}
+
+	if ((ret = my_wrap_submit_request(&request_stream_id, data, "/")) != 0) {
+		goto out;
+	}
+
+	data->nghttp3_ctx->stream_id = request_stream_id;
+
+	out:
+	return ret;
+}
+
+int my_wrap_cb_ack_data (
+		int64_t stream_id,
+		size_t bytes,
+		void *arg
+) {
+	struct my_wrap_data *data = arg;
+
+	int ret = 0;
+	ssize_t ret_tmp = 0;
+
+	if ((ret_tmp = nghttp3_conn_add_ack_offset (
+			data->nghttp3_ctx->conn,
+			stream_id,
+			bytes
+	)) != 0) {
+		printf("Error while ACKing data: %s\n", nghttp3_strerror(ret_tmp));
+		ret = 1;
+		goto out;
+	}
+
+	out:
+	return ret;
+}
+
+int my_wrap_cb_get_data (
+		int64_t *stream_id,
+		ngtcp2_vec *vec,
+		size_t *vec_count,
+		int *fin,
+		void *arg
+) {  
+	struct my_wrap_data *data = arg;
+
+	int ret = 0;
+	ssize_t ret_tmp = 0;
+
+	assert(sizeof(*vec) == sizeof(nghttp3_vec));
+
+	if ((ret_tmp = nghttp3_conn_writev_stream (
+			data->nghttp3_ctx->conn,
+			stream_id,
+			fin,
+			(nghttp3_vec *) vec,
+			*vec_count
+	)) < 0) {
+		printf("Failed to get http3 data %s\n", nghttp3_strerror(ret_tmp));
+		ret = 1;
+		goto out;
+	}
+
+	*vec_count = (size_t) ret_tmp;
+
+	out:
+	return ret;
+}
+
 int main(int argc, const char **argv) {
 	(void)(argc);
 	(void)(argv);
 
-	struct my_ngtcp2 ctx;
-	int ret = 0;
 	int fd = 0;
+
+	struct my_nghttp3_ctx nghttp3_ctx;
+	struct my_ngtcp2_ctx ngtcp2_ctx;
+	struct my_wrap_data wrap_data = {&ngtcp2_ctx, &nghttp3_ctx};
+
+	int ret = 0;
 
 	struct sockaddr_in addr_remote;
 	struct sockaddr_storage addr_local;
@@ -782,6 +1143,8 @@ int main(int argc, const char **argv) {
 	memset(&addr_local, 0, sizeof(addr_local));
 
 	addr_remote.sin_family = AF_INET;
+	//addr_remote.sin_addr.s_addr = inet_addr ("142.250.74.164");
+	//addr_remote.sin_port = htons(443);
 	addr_remote.sin_addr.s_addr = inet_addr ("127.0.0.1");
 	addr_remote.sin_port = htons(4433);
 
@@ -792,31 +1155,45 @@ int main(int argc, const char **argv) {
 	}
 
 	if (my_ngtcp2_ctx_init (
-			&ctx,
+			&ngtcp2_ctx,
 			(const struct sockaddr *) &addr_remote,
 			sizeof(addr_remote),
 			(const struct sockaddr *) &addr_local,
 			addr_local_len,
-			fd
+			fd,
+			my_wrap_cb_ready,
+			my_wrap_cb_get_data,
+			my_wrap_cb_ack_data,
+			&wrap_data
 	) != 0) {
 		goto out_close;
+	}
+
+	if ((ret = my_nghttp3_ctx_init (
+			&nghttp3_ctx
+	)) != 0) {
+		goto out_ngtcp2_cleanup;
 	}
 
 	const struct timeval timeout_read = {0, 500000};
 	const struct timeval timeout_handshake = {HANDSHAKE_TIMEOUT_S, 0};
 
-	event_add(ctx.event_read, &timeout_read);
-	event_add(ctx.event_timeout, &timeout_handshake);
+	event_add(ngtcp2_ctx.event_read, &timeout_read);
+	event_add(ngtcp2_ctx.event_timeout, &timeout_handshake);
 
 	// Start with sending the handshake
-	event_active(ctx.event_write, 0, 0);
+	event_active(ngtcp2_ctx.event_write, 0, 0);
 
-	ret = (event_base_loop(ctx.event, 0) != 0
+	ret = (event_base_loop(ngtcp2_ctx.event, 0) != 0
 		? 1
 		: 0
-	) | ctx.event_ret;
+	) | ngtcp2_ctx.event_ret;
 
-	my_ngtcp2_ctx_cleanup(&ctx);
+	goto out_nghttp3_cleanup;
+	out_nghttp3_cleanup:
+		my_nghttp3_ctx_cleanup(&nghttp3_ctx);
+	out_ngtcp2_cleanup:
+		my_ngtcp2_ctx_cleanup(&ngtcp2_ctx);
 	out_close:
 		close(fd);
 	out:
