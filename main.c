@@ -29,23 +29,16 @@
 #define PONG_TIMEOUT_S (KEEP_ALIVE_S * 2)
 #define HANDSHAKE_TIMEOUT_S 1
 
-struct mydata {
-	char *buf;       /* pointer to the buffer */
-	size_t alloclen; /* size of allocation */
-	size_t len;      /* size of content in buffer */
-	size_t nread;    /* how many bytes have been read */
-};
-
-struct mystream {
+struct my_ngtcp2_stream {
 	int64_t id;
 	const uint8_t *data;
 	size_t bytes_total;
 	size_t bytes_written;
 };
 
-struct myctx {
-	ngtcp2_conn *ngtcp2;
-	ngtcp2_crypto_conn_ref ngtcp2_ref;
+struct my_ngtcp2 {
+	ngtcp2_conn *conn;
+	ngtcp2_crypto_conn_ref conn_ref;
 	ngtcp2_path path;
 	ngtcp2_settings settings;
 	ngtcp2_transport_params transport_params;
@@ -63,10 +56,10 @@ struct myctx {
 	struct event *event_timeout;
 	int event_ret;
 	int handshake_complete;
-	struct mystream stream;
+	struct my_ngtcp2_stream stream;
 };
 
-void myrandom(void *target, size_t bytes) {
+void my_random(void *target, size_t bytes) {
 	static int first = 1;
 
 	if (first) {
@@ -82,7 +75,7 @@ void myrandom(void *target, size_t bytes) {
 	}
 }
 
-int mytimestamp(uint64_t *result) {
+int my_timestamp_nano(uint64_t *result) {
 	struct timespec tp;
 
 	*result = 0;
@@ -97,7 +90,7 @@ int mytimestamp(uint64_t *result) {
 	return 0;
 }
 
-int callback_handshake_completed (ngtcp2_conn *conn, void *user_data) {
+int my_ngtcp2_cb_handshake_complete (ngtcp2_conn *conn, void *user_data) {
 	(void)(user_data);
 
 	printf("Handshake complete\n");
@@ -107,7 +100,7 @@ int callback_handshake_completed (ngtcp2_conn *conn, void *user_data) {
 	return 0;
 }
 
-int callback_receive_stream_data (
+int my_ngtcp2_cb_receive_stream_data (
 		ngtcp2_conn *conn,
 		uint32_t flags,
 		int64_t stream_id,
@@ -135,7 +128,7 @@ int callback_receive_stream_data (
 	return 0;
 }
 
-int callback_acked_stream_data_offset (
+int my_ngtcp2_cb_acked_stream_data_offset (
 		ngtcp2_conn *conn,
 		int64_t stream_id,
 		uint64_t offset,
@@ -156,7 +149,7 @@ int callback_acked_stream_data_offset (
 	return 0;
 }
 		
-int callback_stream_close (
+int my_ngtcp2_cb_stream_close (
 		ngtcp2_conn *conn,
 		uint32_t flags,
 		int64_t stream_id,
@@ -179,7 +172,7 @@ int callback_stream_close (
 	return 0;
 }
 		
-int callback_extend_max_local_streams_bidi (
+int my_ngtcp2_cb_extend_max_local_streams_bidi (
 		ngtcp2_conn *conn,
 		uint64_t max_streams,
 		void *user_data
@@ -192,16 +185,16 @@ int callback_extend_max_local_streams_bidi (
 	return 0;
 }
 
-void callback_rand (
+void my_ngtcp2_cb_random (
 		uint8_t *dest,
 		size_t destlen,
 		const ngtcp2_rand_ctx *rand_ctx
 ) {
 	(void)(rand_ctx);
-	myrandom(dest, destlen);
+	my_random(dest, destlen);
 }
 
-int callback_get_new_connection_id (
+int my_ngtcp2_cb_get_new_connection_id (
 		ngtcp2_conn *conn,
 		ngtcp2_cid *cid,
 		uint8_t *token,
@@ -212,13 +205,13 @@ int callback_get_new_connection_id (
 	(void)(user_data);
 
 	cid->datalen = cidlen;
-	myrandom(&cid->data, cidlen);
-	myrandom(token, NGTCP2_STATELESS_RESET_TOKENLEN);
+	my_random(&cid->data, cidlen);
+	my_random(token, NGTCP2_STATELESS_RESET_TOKENLEN);
 
 	return 0;
 }
 		
-int callback_stream_reset (
+int my_ngtcp2_cb_stream_reset (
 		ngtcp2_conn *conn,
 		int64_t stream_id,
 		uint64_t final_size,
@@ -240,7 +233,7 @@ int callback_stream_reset (
 	return 0;
 }
 
-int callback_extend_max_stream_data (
+int my_ngtcp2_cb_extend_max_stream_data (
 		ngtcp2_conn *conn,
 		int64_t stream_id,
 		uint64_t max_data,
@@ -259,7 +252,7 @@ int callback_extend_max_stream_data (
 	return 0;
 }
 
-int callback_stream_stop_sending (
+int my_ngtcp2_cb_stream_stop_sending (
 		ngtcp2_conn *conn,
 		int64_t stream_id,
 		uint64_t app_error_code,
@@ -279,8 +272,16 @@ int callback_stream_stop_sending (
 	return 0;
 }
 
-size_t myget_message (
-		struct myctx *ctx,
+int my_ngtcp2_cb_initial (
+		ngtcp2_conn *conn,
+		void *user_data
+) {
+	printf("Initial\n");
+	return ngtcp2_crypto_client_initial_cb(conn, user_data);
+}
+
+size_t my_ngtcp2_get_message (
+		struct my_ngtcp2 *ctx,
 		int64_t *stream_id,
 		int *fin,
 		ngtcp2_vec *data_vector,
@@ -310,7 +311,7 @@ size_t myget_message (
 	return 0;
 }
 
-int mysend_packet (
+int my_ngtcp2_send_packet (
 		evutil_socket_t fd,
 		const struct sockaddr *addr,
 		socklen_t addr_len,
@@ -339,7 +340,7 @@ int mysend_packet (
 }
 
 void event_read (evutil_socket_t fd, short e, void *a) {
-	struct myctx *ctx = a;
+	struct my_ngtcp2 *ctx = a;
 
 	(void)(e);
 
@@ -356,7 +357,7 @@ void event_read (evutil_socket_t fd, short e, void *a) {
 	printf("Read event\n");
 
 	for (;;) {
-		if (mytimestamp(&timestamp) != 0) {
+		if (my_timestamp_nano(&timestamp) != 0) {
 			goto out_failure;
 		}
 
@@ -383,7 +384,7 @@ void event_read (evutil_socket_t fd, short e, void *a) {
 		path.remote.addrlen = remote_addr_len;
 
 		if ((ret_tmp = ngtcp2_conn_read_pkt (
-				ctx->ngtcp2,
+				ctx->conn,
 				&path,
 				&packet_info,
 				(const uint8_t *) buf,
@@ -398,7 +399,7 @@ void event_read (evutil_socket_t fd, short e, void *a) {
 				printf("Crypto error while reading packet: %s\n", ngtcp2_strerror(ret_tmp));
 				ngtcp2_connection_close_error_set_transport_error_tls_alert (
 						&ctx->last_error,
-						ngtcp2_conn_get_tls_alert(ctx->ngtcp2),
+						ngtcp2_conn_get_tls_alert(ctx->conn),
 						NULL,
 						0
 				);
@@ -438,7 +439,7 @@ void event_read (evutil_socket_t fd, short e, void *a) {
 }
 
 void event_timeout (evutil_socket_t fd, short e, void *a) {
-	struct myctx *ctx = a;
+	struct my_ngtcp2 *ctx = a;
 
 	(void)(fd);
 	(void)(e);
@@ -450,7 +451,7 @@ void event_timeout (evutil_socket_t fd, short e, void *a) {
 }
 
 void event_write (evutil_socket_t fd, short e, void *a) {
-	struct myctx *ctx = a;
+	struct my_ngtcp2 *ctx = a;
 
 	(void)(e);
 
@@ -471,11 +472,11 @@ void event_write (evutil_socket_t fd, short e, void *a) {
 	printf("Write event\n");
 
 	for (;;) {
-		if (mytimestamp(&timestamp) != 0) {
+		if (my_timestamp_nano(&timestamp) != 0) {
 			goto out_failure;
 		}
 
-		data_vector_count = myget_message (
+		data_vector_count = my_ngtcp2_get_message (
 				ctx,
 				&stream_id,
 				&fin,
@@ -488,7 +489,7 @@ void event_write (evutil_socket_t fd, short e, void *a) {
 		flags = NGTCP2_WRITE_STREAM_FLAG_MORE | (fin ? NGTCP2_WRITE_STREAM_FLAG_FIN : 0);
 
 		write_count = ngtcp2_conn_writev_stream (
-				ctx->ngtcp2,
+				ctx->conn,
 				&path_storage.path,
 				&packet_info,
 				(uint8_t *) buf,
@@ -520,7 +521,7 @@ void event_write (evutil_socket_t fd, short e, void *a) {
 			ctx->stream.bytes_written += (size_t) write_bytes;
 		}
 
-		if (mysend_packet (
+		if (my_ngtcp2_send_packet (
 				fd,
 				(const struct sockaddr *) &ctx->addr_remote,
 				ctx->addr_local_len,
@@ -539,20 +540,15 @@ void event_write (evutil_socket_t fd, short e, void *a) {
 	event_base_loopbreak(ctx->event);
 }
 
-static ngtcp2_conn *myget_conn (
-	ngtcp2_crypto_conn_ref *ngtcp2_ref
+static ngtcp2_conn *my_ngtcp2_get_conn (
+		ngtcp2_crypto_conn_ref *ngtcp2_ref
 ) {
-	struct myctx *ctx = ngtcp2_ref->user_data;
-	return ctx->ngtcp2;
-}
-		
-int myinitial_cb (ngtcp2_conn *conn, void *user_data) {
-	printf("Initial\n");
-	return ngtcp2_crypto_client_initial_cb(conn, user_data);
+	struct my_ngtcp2 *ctx = ngtcp2_ref->user_data;
+	return ctx->conn;
 }
 
-int myctx_init (
-		struct myctx *ctx,
+int my_ngtcp2_ctx_init (
+		struct my_ngtcp2 *ctx,
 		const struct sockaddr *addr_remote,
 		const socklen_t addr_remote_len,
 		const struct sockaddr *addr_local,
@@ -564,8 +560,8 @@ int myctx_init (
 	memset(ctx, 0, sizeof(*ctx));
 
 	ctx->stream.id = -1;
-	ctx->ngtcp2_ref.get_conn = myget_conn;
-	ctx->ngtcp2_ref.user_data = ctx;
+	ctx->conn_ref.get_conn = my_ngtcp2_get_conn;
+	ctx->conn_ref.user_data = ctx;
 
 	assert(sizeof(ctx->addr_remote) >= addr_remote_len);
 	assert(sizeof(ctx->addr_local) >= addr_local_len);
@@ -616,7 +612,7 @@ int myctx_init (
 		goto out_destroy_ssl;
 	}
 
-	SSL_set_app_data(ctx->ssl, &ctx->ngtcp2_ref);
+	SSL_set_app_data(ctx->ssl, &ctx->conn_ref);
 	SSL_set_connect_state(ctx->ssl);
 	SSL_set_quic_use_legacy_codepoint(ctx->ssl, 0);
 
@@ -635,10 +631,10 @@ int myctx_init (
 	ngtcp2_settings_default(&ctx->settings);
 	ngtcp2_transport_params_default(&ctx->transport_params);
 
-	myrandom(&dcid.data, dcid.datalen);
-	myrandom(&scid.data, scid.datalen);
+	my_random(&dcid.data, dcid.datalen);
+	my_random(&scid.data, scid.datalen);
 
-	if (mytimestamp(&ctx->settings.initial_ts) != 0) {
+	if (my_timestamp_nano(&ctx->settings.initial_ts) != 0) {
 		goto out_destroy_ssl;
 	}
 
@@ -647,32 +643,32 @@ int myctx_init (
 	ctx->transport_params.initial_max_data = 1024 * 1024;
 
 	static ngtcp2_callbacks callbacks = {
-		myinitial_cb,
+		my_ngtcp2_cb_initial,
 		NULL, /* recv_client_initial */
 		ngtcp2_crypto_recv_crypto_data_cb,
-		callback_handshake_completed,
+		my_ngtcp2_cb_handshake_complete,
 		NULL, /* recv_version_negotiation */
 		ngtcp2_crypto_encrypt_cb,
 		ngtcp2_crypto_decrypt_cb,
 		ngtcp2_crypto_hp_mask_cb,
-		callback_receive_stream_data,
-		callback_acked_stream_data_offset,
+		my_ngtcp2_cb_receive_stream_data,
+		my_ngtcp2_cb_acked_stream_data_offset,
 		NULL, /* stream_open */
-		callback_stream_close,
+		my_ngtcp2_cb_stream_close,
 		NULL, /* recv_stateless_reset */
 		ngtcp2_crypto_recv_retry_cb,
-		callback_extend_max_local_streams_bidi,
+		my_ngtcp2_cb_extend_max_local_streams_bidi,
 		NULL, /* extend_max_local_streams_uni */
-		callback_rand,
-		callback_get_new_connection_id,
+		my_ngtcp2_cb_random,
+		my_ngtcp2_cb_get_new_connection_id,
 		NULL, /* remove_connection_id */
 		ngtcp2_crypto_update_key_cb,
 		NULL, /* path_validation */
 		NULL, /* select_preferred_addr */
-		callback_stream_reset,
+		my_ngtcp2_cb_stream_reset,
 		NULL, /* extend_max_remote_streams_bidi */
 		NULL, /* extend_max_remote_streams_uni */
-		callback_extend_max_stream_data,
+		my_ngtcp2_cb_extend_max_stream_data,
 		NULL, /* dcid_status */
 		NULL, /* handshake_confirmed */
 		NULL, /* recv_new_token */
@@ -682,7 +678,7 @@ int myctx_init (
 		NULL, /* ack_datagram */
 		NULL, /* lost_datagram */
 		ngtcp2_crypto_get_path_challenge_data_cb,
-		callback_stream_stop_sending,
+		my_ngtcp2_cb_stream_stop_sending,
 		ngtcp2_crypto_version_negotiation_cb,
 		NULL, /* recv_rx_key */
 		NULL  /* recv_tx_key */
@@ -692,7 +688,7 @@ int myctx_init (
 	ngtcp2_addr_init(&ctx->path.local, addr_local, addr_local_len);
 
 	if (ngtcp2_conn_client_new (
-			&ctx->ngtcp2,
+			&ctx->conn,
 			&dcid,
 			&scid,
 			&ctx->path,
@@ -708,7 +704,7 @@ int myctx_init (
 		goto out_destroy_ssl;
 	}
 
-	ngtcp2_conn_set_tls_native_handle(ctx->ngtcp2, ctx->ssl);
+	ngtcp2_conn_set_tls_native_handle(ctx->conn, ctx->ssl);
 	ngtcp2_connection_close_error_default(&ctx->last_error);
 
 	if ((ctx->event = event_base_new ()) == NULL) {
@@ -745,7 +741,7 @@ int myctx_init (
 	out_free_event_base:
 		event_base_free(ctx->event);
 	out_del_ngtcp2:
-		ngtcp2_conn_del(ctx->ngtcp2);
+		ngtcp2_conn_del(ctx->conn);
 	out_destroy_ssl:
 		SSL_free(ctx->ssl);
 	out_destroy_ctx:
@@ -754,8 +750,8 @@ int myctx_init (
 		return ret;
 }
 
-void myctx_cleanup(struct myctx *ctx) {
-	ngtcp2_conn_del(ctx->ngtcp2);
+void my_ngtcp2_ctx_cleanup(struct my_ngtcp2 *ctx) {
+	ngtcp2_conn_del(ctx->conn);
 	SSL_free(ctx->ssl);
 	SSL_CTX_free(ctx->sslctx);
 	event_free(ctx->event_read);
@@ -768,7 +764,7 @@ int main(int argc, const char **argv) {
 	(void)(argc);
 	(void)(argv);
 
-	struct myctx ctx;
+	struct my_ngtcp2 ctx;
 	int ret = 0;
 	int fd = 0;
 
@@ -795,7 +791,7 @@ int main(int argc, const char **argv) {
 		goto out_close;
 	}
 
-	if (myctx_init (
+	if (my_ngtcp2_ctx_init (
 			&ctx,
 			(const struct sockaddr *) &addr_remote,
 			sizeof(addr_remote),
@@ -820,7 +816,7 @@ int main(int argc, const char **argv) {
 		: 0
 	) | ctx.event_ret;
 
-	myctx_cleanup(&ctx);
+	my_ngtcp2_ctx_cleanup(&ctx);
 	out_close:
 		close(fd);
 	out:
