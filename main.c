@@ -36,6 +36,7 @@
 typedef int (*my_ngtcp2_cb_ready)(void *arg);
 typedef int (*my_ngtcp2_cb_get_data)(int64_t *stream_id, ngtcp2_vec *vec, size_t *vec_count, int *fin, void *arg);
 typedef int (*my_ngtcp2_cb_ack_data)(int64_t stream_id, size_t bytes, void *arg);
+typedef int (*my_ngtcp2_cb_deliver_data)(size_t *consumed, int64_t stream_id, const uint8_t *buf, size_t buflen, int fin, void *arg);
 typedef int (*my_ngtcp2_cb_block_stream)(int64_t stream_id, int blocked, void *arg);
 
 struct my_ngtcp2_ctx {
@@ -61,6 +62,7 @@ struct my_ngtcp2_ctx {
 	my_ngtcp2_cb_ready cb_ready;
 	my_ngtcp2_cb_get_data cb_get_data;
 	my_ngtcp2_cb_ack_data cb_ack_data;
+	my_ngtcp2_cb_deliver_data cb_deliver_data;
 	my_ngtcp2_cb_block_stream cb_block_stream;
 	void *cb_arg;
 };
@@ -121,20 +123,30 @@ int my_ngtcp2_cb_receive_stream_data (
 		void *user_data,
 		void *stream_user_data
 ) {
+	struct my_ngtcp2_ctx *ctx = user_data;
+
 	(void)(offset);
-	(void)(user_data);
 	(void)(stream_user_data);
 
-	const int finished = (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0;
+	size_t consumed = 0;
 
-	printf("Receive: %llu - %s (%i)\n", (unsigned long long) buflen, buf, finished);
+	printf("Receive: %llu - %s fin %i\n", (unsigned long long) buflen, buf, flags & NGTCP2_STREAM_DATA_FLAG_FIN);
 
-	// nghttp3_conn_read_stream
+	if (ctx->cb_deliver_data (
+			&consumed,
+			stream_id,
+			buf,
+			buflen,
+			(flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0,
+			ctx->cb_arg
+	) != 0) {
+		return 1;
+	}
 
 	// NGTCP2_ERR_CALLBACK_FAILURE / ngtcp2_conection_close_error_set_application_error
 
-	ngtcp2_conn_extend_max_stream_offset(conn, stream_id, buflen);
-	ngtcp2_conn_extend_max_offset(conn, buflen);
+	ngtcp2_conn_extend_max_stream_offset(conn, stream_id, consumed);
+	ngtcp2_conn_extend_max_offset(conn, consumed);
 
 	return 0;
 }
@@ -604,6 +616,7 @@ int my_ngtcp2_ctx_init (
 		my_ngtcp2_cb_ready cb_ready,
 		my_ngtcp2_cb_get_data cb_get_data,
 		my_ngtcp2_cb_ack_data cb_ack_data,
+		my_ngtcp2_cb_deliver_data cb_deliver_data,
 		my_ngtcp2_cb_block_stream cb_block_stream,
 		void *cb_arg
 ) {
@@ -617,6 +630,7 @@ int my_ngtcp2_ctx_init (
 	ctx->cb_ready = cb_ready;
 	ctx->cb_get_data = cb_get_data;
 	ctx->cb_ack_data = cb_ack_data;
+	ctx->cb_deliver_data = cb_deliver_data;
 	ctx->cb_block_stream = cb_block_stream;
 	ctx->cb_arg = cb_arg;
 
@@ -861,6 +875,9 @@ int my_nghttp3_cb_recv_data (
 	(void)(datalen);
 	(void)(conn_user_data);
 	(void)(stream_user_data);
+
+	printf("Data: %.*s\n", (int) datalen, data);
+
 	return 0;
 }
 
@@ -930,6 +947,19 @@ int my_nghttp3_cb_reset_stream (
 	return 0;
 }
 
+int my_nghttp3_cb_end_stream (
+		nghttp3_conn *conn,
+		int64_t stream_id,
+		void *conn_user_data,
+		void *stream_user_data
+) {
+	(void)(conn);
+	(void)(stream_id);
+	(void)(conn_user_data);
+	(void)(stream_user_data);
+	return 0;
+}
+
 int my_nghttp3_ctx_init (
 		struct my_nghttp3_ctx *ctx
 ) {
@@ -949,7 +979,7 @@ int my_nghttp3_ctx_init (
 		NULL, /* recv_trailer */
 		NULL, /* end_trailers */
 		my_nghttp3_cb_stop_sending,
-		NULL, /* end_stream */
+		my_nghttp3_cb_end_stream,
 		my_nghttp3_cb_reset_stream,
 		NULL, /* shutdown */
 	};
@@ -1180,6 +1210,39 @@ int my_wrap_cb_get_data (
 	return ret;
 }
 
+int my_wrap_cb_deliver_data (
+		size_t *consumed,
+		int64_t stream_id,
+		const uint8_t *buf,
+		size_t buflen,
+		int fin,
+		void *arg
+) {
+	struct my_wrap_data *data = arg;
+
+	int ret = 0;
+	ssize_t ret_tmp = 0;
+
+	*consumed = 0;
+
+	if ((ret_tmp = nghttp3_conn_read_stream (
+			data->nghttp3_ctx->conn,
+			stream_id,
+			buf,
+			buflen,
+			fin
+	)) < 0) {
+		printf("Failed to deliver http3 data %s\n", nghttp3_strerror(ret_tmp));
+		ret = 1;
+		goto out;
+	}
+
+	*consumed = (size_t) ret_tmp;
+
+	out:
+	return ret;
+}
+
 int main(int argc, const char **argv) {
 	(void)(argc);
 	(void)(argv);
@@ -1225,6 +1288,7 @@ int main(int argc, const char **argv) {
 			my_wrap_cb_ready,
 			my_wrap_cb_get_data,
 			my_wrap_cb_ack_data,
+			my_wrap_cb_deliver_data,
 			my_wrap_cb_block_stream,
 			&wrap_data
 	) != 0) {
