@@ -28,10 +28,15 @@
 #define KEEP_ALIVE_S 10
 #define PONG_TIMEOUT_S (KEEP_ALIVE_S * 2)
 #define HANDSHAKE_TIMEOUT_S 1
+#define SERVER_ADDR "127.0.0.1"
+#define SERVER_PORT 4433
+//#define SERVER_ADDR "142.250.74.164"
+//#define SERVER_PORT 443
 
 typedef int (*my_ngtcp2_cb_ready)(void *arg);
 typedef int (*my_ngtcp2_cb_get_data)(int64_t *stream_id, ngtcp2_vec *vec, size_t *vec_count, int *fin, void *arg);
 typedef int (*my_ngtcp2_cb_ack_data)(int64_t stream_id, size_t bytes, void *arg);
+typedef int (*my_ngtcp2_cb_block_stream)(int64_t stream_id, int blocked, void *arg);
 
 struct my_ngtcp2_ctx {
 	ngtcp2_conn *conn;
@@ -56,6 +61,7 @@ struct my_ngtcp2_ctx {
 	my_ngtcp2_cb_ready cb_ready;
 	my_ngtcp2_cb_get_data cb_get_data;
 	my_ngtcp2_cb_ack_data cb_ack_data;
+	my_ngtcp2_cb_block_stream cb_block_stream;
 	void *cb_arg;
 };
 
@@ -143,16 +149,12 @@ int my_ngtcp2_cb_acked_stream_data_offset (
 ) {
 	struct my_ngtcp2_ctx *ctx = user_data;
 
+	(void)(ctx);
 	(void)(conn);
 	(void)(offset);
 	(void)(stream_user_data);
 
-	printf("Acked: Stream %lli, %llu bytes \n", (long long int) stream_id, (unsigned long long) datalen);
-
-	if (ctx->cb_ack_data(stream_id, datalen, ctx->cb_arg) != 0) {
-//		ngtcp2_connection_close_error_set_application_error();
-		return NGTCP2_ERR_CALLBACK_FAILURE;
-	}
+	printf("ACK from remote Stream %lli, %llu bytes \n", (long long int) stream_id, (unsigned long long) datalen);
 
 	// nghttp3_conn_add_ack_offset(m stream_id, datalen);
 	// NGTCP2_ERR_CALLBACK_FAILURE / ngtcp2_conection_close_error_set_application_error
@@ -168,7 +170,6 @@ int my_ngtcp2_cb_stream_close (
 		void *stream_user_data
 ) {
 	(void)(conn);
-	(void)(stream_id);
 	(void)(app_error_code);
 	(void)(user_data);
 	(void)(stream_user_data);
@@ -177,7 +178,7 @@ int my_ngtcp2_cb_stream_close (
 		// app_error_close = NGHTTP3_H3_NO_ERROR;
 	}
 
-	printf("Close\n");
+	printf("Close stream %li\n", stream_id);
 
 	return 0;
 }
@@ -258,14 +259,17 @@ int my_ngtcp2_cb_extend_max_stream_data (
 		void *user_data,
 		void *stream_user_data
 ) {
+	struct my_ngtcp2_ctx *ctx = user_data;
+
 	(void)(conn);
-	(void)(stream_id);
-	(void)(user_data);
+	(void)(max_data);
 	(void)(stream_user_data);
 
-	printf("Extend max stream data: %llu\n", (unsigned long long) max_data);
+	printf("Extend max stream data stream %lli\n", (long long int) stream_id);
 
-	// NGTCP2_ERR_CALLBACK_FAILURE - nghttp3_conn_unblock_stream
+	if (ctx->cb_ready != NULL && ctx->cb_block_stream(stream_id, 0 /* Unblock */, ctx->cb_arg) != 0) {
+		return 1;
+	}
 
 	return 0;
 }
@@ -460,51 +464,65 @@ void event_timeout (evutil_socket_t fd, short e, void *a) {
 	event_base_loopbreak(ctx->event);
 }
 
+uint64_t vec_len(const ngtcp2_vec *vec, size_t n) {
+	size_t i;
+	size_t res = 0;
+
+	for (i = 0; i < n; ++i) {
+		res += vec[i].len;
+	}
+
+	return res;
+}
+
 void event_write (evutil_socket_t fd, short e, void *a) {
 	struct my_ngtcp2_ctx *ctx = a;
 
 	(void)(e);
 
 	char buf[1280];
-	ngtcp2_vec data_vector = {0};
+	ngtcp2_vec data_vector[128] = {0};
+	size_t data_vector_count = 0;
 	ngtcp2_path_storage path_storage;
 	ngtcp2_pkt_info packet_info = {0};
 	int fin = 0;
-	int flags = 0;
 	ngtcp2_ssize bytes_from_src = 0;
 	ngtcp2_ssize bytes_to_buf = 0;
 	uint64_t timestamp = 0;
 	int64_t stream_id = -1;
-	size_t data_vector_count = 1;
 
 	ngtcp2_path_storage_zero(&path_storage);
 
 	printf("Write event\n");
-
-	if (my_ngtcp2_get_message (
-				ctx,
-				&stream_id,
-				&data_vector,
-				&data_vector_count,
-				&fin
-				) != 0) {
-		goto out_failure;
-	}
 
 	for (;;) {
 		if (my_timestamp_nano(&timestamp) != 0) {
 			goto out_failure;
 		}
 
-		printf("Vector count %llu stream ID %lli fin %i data %p len %llu\n",
+		printf("++ Loop\n");
+
+		data_vector_count = sizeof(data_vector)/sizeof(*data_vector);
+		if (my_ngtcp2_get_message (
+					ctx,
+					&stream_id,
+					data_vector,
+					&data_vector_count,
+					&fin
+		) != 0) {
+			goto out_failure;
+		}
+
+		printf("Vector count %llu len %llu stream ID %lli fin %i\n",
 				(unsigned long long) data_vector_count,
+				(unsigned long long) vec_len(data_vector, data_vector_count),
 				(long long int) stream_id,
-				fin,
-				data_vector.base,
-				(unsigned long long) data_vector.len
+				fin
 		);
 
-		flags = NGTCP2_WRITE_STREAM_FLAG_MORE | (fin ? NGTCP2_WRITE_STREAM_FLAG_FIN : 0);
+		if (!fin && stream_id == -1 && data_vector_count == 0) {
+			printf("- No data from http3\n");
+		}
 
 		bytes_to_buf = ngtcp2_conn_writev_stream (
 				ctx->conn,
@@ -513,18 +531,32 @@ void event_write (evutil_socket_t fd, short e, void *a) {
 				(uint8_t *) buf,
 				sizeof(buf),
 				&bytes_from_src,
-				flags,
+				NGTCP2_WRITE_STREAM_FLAG_MORE | (fin ? NGTCP2_WRITE_STREAM_FLAG_FIN : 0),
 				stream_id,
-				&data_vector,
+				data_vector,
 				data_vector_count,
 				timestamp
 		);
 
-		printf("Write count: %li, Write bytes: %li\n", bytes_to_buf, bytes_from_src);
+		printf("- Write out: %li, Write in: %li\n", bytes_to_buf, bytes_from_src);
 
 		if (bytes_to_buf < 0) {
-			if (bytes_to_buf == NGTCP2_ERR_WRITE_MORE) {
+			if (bytes_to_buf == NGTCP2_ERR_STREAM_DATA_BLOCKED || bytes_to_buf == NGTCP2_ERR_STREAM_SHUT_WR) {
+				printf("- Blocked\n");
+				if (ctx->cb_block_stream(stream_id, 1 /* Blocked*/, ctx->cb_arg) != 0) {
+					//		ngtcp2_connection_close_error_set_application_error();
+					goto out_failure;
+				}
+			}
+			else if (bytes_to_buf == NGTCP2_ERR_WRITE_MORE) {
 				// Must call writev repeatedly until complete.
+				assert(bytes_from_src >= 0);
+				printf("- More\n");
+
+				if (ctx->cb_ack_data(stream_id, bytes_from_src, ctx->cb_arg) != 0) {
+					//		ngtcp2_connection_close_error_set_application_error();
+					goto out_failure;
+				}
 			}
 			else {
 				printf("Error while writing: %s\n", ngtcp2_strerror((int) bytes_to_buf));
@@ -532,24 +564,13 @@ void event_write (evutil_socket_t fd, short e, void *a) {
 			}
 		}
 		else if (bytes_to_buf == 0) {
-			event_del(ctx->event_write);
 			break;
-		}
-
-		if (bytes_from_src > 0) {
-			assert((size_t) bytes_from_src <= data_vector.len);
-			data_vector.base += (size_t) bytes_from_src;
-			data_vector.len -= (size_t) bytes_from_src;
-		}
-
-		if (data_vector.len == 0) {
-			stream_id = -1;
 		}
 
 		if (bytes_to_buf > 0 && my_ngtcp2_send_packet (
 					fd,
-					(const struct sockaddr *) &ctx->addr_remote,
-					ctx->addr_local_len,
+					(const struct sockaddr *) path_storage.path.remote.addr,
+					path_storage.path.remote.addrlen,
 					(const uint8_t *) buf,
 					bytes_to_buf
 		) != 0) {
@@ -561,8 +582,9 @@ void event_write (evutil_socket_t fd, short e, void *a) {
 
 	return;
 	out_failure:
-	ctx->event_ret = 1;
-	event_base_loopbreak(ctx->event);
+		ctx->event_ret = 1;
+		event_base_loopbreak(ctx->event);
+		return;
 }
 
 static ngtcp2_conn *my_ngtcp2_get_conn (
@@ -582,6 +604,7 @@ int my_ngtcp2_ctx_init (
 		my_ngtcp2_cb_ready cb_ready,
 		my_ngtcp2_cb_get_data cb_get_data,
 		my_ngtcp2_cb_ack_data cb_ack_data,
+		my_ngtcp2_cb_block_stream cb_block_stream,
 		void *cb_arg
 ) {
 	int ret = 0;
@@ -594,6 +617,7 @@ int my_ngtcp2_ctx_init (
 	ctx->cb_ready = cb_ready;
 	ctx->cb_get_data = cb_get_data;
 	ctx->cb_ack_data = cb_ack_data;
+	ctx->cb_block_stream = cb_block_stream;
 	ctx->cb_arg = cb_arg;
 
 	assert(sizeof(ctx->addr_remote) >= addr_remote_len);
@@ -963,7 +987,8 @@ struct my_wrap_data {
 int my_wrap_submit_request (
 		int64_t *result,
 		struct my_wrap_data *data,
-		const char *endpoint
+		const char *endpoint,
+		const char *host
 ) {
 	int ret = 0;
 	int ret_tmp;
@@ -977,7 +1002,7 @@ int my_wrap_submit_request (
 		goto out;
 	}
 
-	nghttp3_nv nv[3] = {0};
+	nghttp3_nv nv[4] = {0};
 
 	// Note : Cast away const
 
@@ -988,15 +1013,22 @@ int my_wrap_submit_request (
 
 	nv[1].name = (uint8_t *) ":scheme";
 	nv[1].namelen = strlen(":scheme");
-	nv[1].value = (uint8_t *) "HTTPS";
-	nv[1].valuelen = strlen("HTTPS");
+	nv[1].value = (uint8_t *) "https";
+	nv[1].valuelen = strlen("https");
 
 	nv[2].name = (uint8_t *) ":path";
 	nv[2].namelen = strlen(":path");
 	nv[2].value = (uint8_t *) endpoint;
 	nv[2].valuelen = strlen(endpoint);
 
-	if ((ret_tmp = nghttp3_conn_submit_request (data->nghttp3_ctx->conn, stream_id, nv, 3, NULL, data)) != 0) {
+	nv[3].name = (uint8_t *) ":authority";
+	nv[3].namelen = strlen(":authority");
+	nv[3].value = (uint8_t *) host;
+	nv[3].valuelen = strlen(host);
+
+	printf("== Submit request %s %s://%s/%s stream %li\n", nv[0].value, nv[1].value, host, endpoint, stream_id);
+
+	if ((ret_tmp = nghttp3_conn_submit_request (data->nghttp3_ctx->conn, stream_id, nv, 4, NULL, data)) != 0) {
 		printf("Failed to submit HTTP3 request: %s\n", nghttp3_strerror(ret_tmp));
 		ret = 1;
 		goto out;
@@ -1051,7 +1083,11 @@ int my_wrap_cb_ready (void *arg) {
 		goto out;
 	}
 
-	if ((ret = my_wrap_submit_request(&request_stream_id, data, "/")) != 0) {
+	if ((ret = my_wrap_submit_request(&request_stream_id, data, "/", SERVER_ADDR)) != 0) {
+		goto out;
+	}
+
+	if ((ret = my_wrap_submit_request(&request_stream_id, data, "/blah", SERVER_ADDR)) != 0) {
 		goto out;
 	}
 
@@ -1071,12 +1107,39 @@ int my_wrap_cb_ack_data (
 	int ret = 0;
 	ssize_t ret_tmp = 0;
 
+	printf("ACK stream %li bytes %lu\n", stream_id, bytes);
+
 	if ((ret_tmp = nghttp3_conn_add_ack_offset (
 			data->nghttp3_ctx->conn,
 			stream_id,
 			bytes
 	)) != 0) {
-		printf("Error while ACKing data: %s\n", nghttp3_strerror(ret_tmp));
+		printf("Error while ACKing data to HTTP3: %s\n", nghttp3_strerror(ret_tmp));
+		ret = 1;
+		goto out;
+	}
+
+	out:
+	return ret;
+}
+
+int my_wrap_cb_block_stream (
+		int64_t stream_id,
+		int blocked,
+		void *arg
+) {
+	struct my_wrap_data *data = arg;
+
+	int ret = 0;
+	ssize_t ret_tmp = 0;
+
+	printf("Block stream %li blocked %i\n", stream_id, blocked);
+
+	if ((ret_tmp = (blocked ? nghttp3_conn_block_stream : nghttp3_conn_unblock_stream) (
+			data->nghttp3_ctx->conn,
+			stream_id
+	)) != 0) {
+		printf("Error while blocking/unblocking HTTP3 stream: %s\n", nghttp3_strerror(ret_tmp));
 		ret = 1;
 		goto out;
 	}
@@ -1143,10 +1206,8 @@ int main(int argc, const char **argv) {
 	memset(&addr_local, 0, sizeof(addr_local));
 
 	addr_remote.sin_family = AF_INET;
-	//addr_remote.sin_addr.s_addr = inet_addr ("142.250.74.164");
-	//addr_remote.sin_port = htons(443);
-	addr_remote.sin_addr.s_addr = inet_addr ("127.0.0.1");
-	addr_remote.sin_port = htons(4433);
+	addr_remote.sin_addr.s_addr = inet_addr(SERVER_ADDR);
+	addr_remote.sin_port = htons(SERVER_PORT);
 
 	if (getsockname(fd, (struct sockaddr *) &addr_local, &addr_local_len) != 0) {
 		printf("Failed to get local address: %s\n", strerror(errno));
@@ -1164,6 +1225,7 @@ int main(int argc, const char **argv) {
 			my_wrap_cb_ready,
 			my_wrap_cb_get_data,
 			my_wrap_cb_ack_data,
+			my_wrap_cb_block_stream,
 			&wrap_data
 	) != 0) {
 		goto out_close;
