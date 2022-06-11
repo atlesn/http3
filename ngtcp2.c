@@ -342,7 +342,7 @@ void event_read (evutil_socket_t fd, short e, void *a) {
 
 	char buf[65536];
 	ssize_t bytes = 0;
-	struct sockaddr_in remote_addr = {0};
+	struct sockaddr_storage remote_addr = {0};
 	socklen_t remote_addr_len = sizeof(remote_addr);
 	ngtcp2_path path = ctx->path;
 	ngtcp2_pkt_info packet_info = {0};
