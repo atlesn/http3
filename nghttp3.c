@@ -1,6 +1,7 @@
 #include <nghttp3/nghttp3.h>
 #include <string.h>
 #include <stdio.h>
+#include <assert.h>
 
 #include "nghttp3.h"
 #include "vec.h"
@@ -204,42 +205,118 @@ void my_nghttp3_ctx_destroy (
 	free(ctx);
 }
 
-int my_nghttp3_submit_request (
+nghttp3_ssize my_nghttp3_cb_read_data (
+		nghttp3_conn *conn,
+		int64_t stream_id,
+		nghttp3_vec *vec,
+		size_t veccnt,
+		uint32_t *pflags,
+		void *conn_user_data,
+		void *stream_user_data
+) {
+	struct my_nghttp3_ctx *ctx = conn_user_data;
+	struct my_nghttp3_data *data = stream_user_data;
+
+	(void)(conn);
+	(void)(ctx);
+	(void)(stream_id);
+
+	nghttp3_ssize ret = 0;
+
+	// return NGHTTP3_ERR_WOULDBLOCK; -> nghttp3_conn_resume_stream
+	// return NGHTTP3_ERR_CALLBACK_FAILURE
+
+	assert(veccnt > 0);
+
+	const size_t to_write = data->data_bytes - data->data_bytes_written;
+	if (to_write > 0) {
+		vec[0].base = (uint8_t *) data->data + data->data_bytes_written;
+		vec[0].len = to_write;
+		data->data_bytes_written += to_write;
+		ret += 1;
+	}
+
+	assert(data->data_bytes_written <= data->data_bytes);
+
+	if  (data->data_bytes_written == data->data_bytes) {
+		*pflags = NGHTTP3_DATA_FLAG_EOF;
+	}
+
+	return ret;
+}
+
+int my_nghttp3_submit_request_with_body (
 		struct my_nghttp3_ctx *ctx,
 		uint64_t stream_id,
 		const char *endpoint,
-		const char *host
+		const char *host,
+		const char *method,
+		const char *content_type,
+		struct my_nghttp3_data *data
 ) {
+	char buf[64];
+	nghttp3_nv nv[6] = {0};
+	nghttp3_data_reader data_reader = {
+		my_nghttp3_cb_read_data
+	};
+	nghttp3_data_reader *data_reader_ptr = NULL;
+
 	int ret = 0;
 	int ret_tmp;
 
-	nghttp3_nv nv[4] = {0};
-
 	// Note : Cast away const
 
-	nv[0].name = (uint8_t *) ":method";
-	nv[0].namelen = strlen(":method");
-	nv[0].value = (uint8_t *) "GET";
-	nv[0].valuelen = strlen("GET");
+	size_t nv_count = 0;
 
-	nv[1].name = (uint8_t *) ":scheme";
-	nv[1].namelen = strlen(":scheme");
-	nv[1].value = (uint8_t *) "https";
-	nv[1].valuelen = strlen("https");
+	nv[nv_count].name = (uint8_t *) ":method";
+	nv[nv_count].namelen = strlen(":method");
+	nv[nv_count].value = (uint8_t *) method;
+	nv[nv_count].valuelen = strlen(method);
+	nv_count++;
 
-	nv[2].name = (uint8_t *) ":path";
-	nv[2].namelen = strlen(":path");
-	nv[2].value = (uint8_t *) endpoint;
-	nv[2].valuelen = strlen(endpoint);
+	nv[nv_count].name = (uint8_t *) ":scheme";
+	nv[nv_count].namelen = strlen(":scheme");
+	nv[nv_count].value = (uint8_t *) "https";
+	nv[nv_count].valuelen = strlen("https");
+	nv_count++;
 
-	nv[3].name = (uint8_t *) ":authority";
-	nv[3].namelen = strlen(":authority");
-	nv[3].value = (uint8_t *) host;
-	nv[3].valuelen = strlen(host);
+	nv[nv_count].name = (uint8_t *) ":path";
+	nv[nv_count].namelen = strlen(":path");
+	nv[nv_count].value = (uint8_t *) endpoint;
+	nv[nv_count].valuelen = strlen(endpoint);
+	nv_count++;
 
-	printf("== Submit request %s %s://%s/%s stream %li\n", nv[0].value, nv[1].value, host, endpoint, stream_id);
+	nv[nv_count].name = (uint8_t *) ":authority";
+	nv[nv_count].namelen = strlen(":authority");
+	nv[nv_count].value = (uint8_t *) host;
+	nv[nv_count].valuelen = strlen(host);
+	nv_count++;
 
-	if ((ret_tmp = nghttp3_conn_submit_request (ctx->conn, stream_id, nv, 4, NULL, ctx)) != 0) {
+	if (data != NULL) {
+		assert(content_type != NULL);
+
+		nv[nv_count].name = (uint8_t *) "content-type";
+		nv[nv_count].namelen = strlen("content-type");
+		nv[nv_count].value = (uint8_t *) content_type;
+		nv[nv_count].valuelen = strlen(content_type);
+		nv_count++;
+
+		sprintf(buf, "%llu", (unsigned long long) data->data_bytes);
+
+		nv[nv_count].name = (uint8_t *) "content-length";
+		nv[nv_count].namelen = strlen("content-length");
+		nv[nv_count].value = (uint8_t *) buf;
+		nv[nv_count].valuelen = strlen(buf);
+		nv_count++;
+
+		data_reader_ptr = &data_reader;
+	}
+
+	assert(nv_count <= sizeof(nv)/sizeof(*nv));
+
+	printf("== Submit %s request %s %s://%s/%s stream %li\n", method, nv[0].value, nv[1].value, host, endpoint, stream_id);
+
+	if ((ret_tmp = nghttp3_conn_submit_request (ctx->conn, stream_id, nv, nv_count, data_reader_ptr, data)) != 0) {
 		printf("Failed to submit HTTP3 request: %s\n", nghttp3_strerror(ret_tmp));
 		ret = 1;
 		goto out;
@@ -247,6 +324,15 @@ int my_nghttp3_submit_request (
 
 	out:
 	return ret;
+}
+
+int my_nghttp3_submit_request (
+		struct my_nghttp3_ctx *ctx,
+		uint64_t stream_id,
+		const char *endpoint,
+		const char *host
+) {
+	return my_nghttp3_submit_request_with_body(ctx, stream_id, endpoint, host, "GET", NULL, NULL);
 }
 
 int my_nghttp3_bind_ctrl_streams (

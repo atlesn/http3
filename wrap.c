@@ -1,22 +1,28 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <assert.h>
 
 #include "wrap.h"
 #include "vec.h"
 #include "ngtcp2.h"
 #include "nghttp3.h"
 
+const char my_wrap_body_content_type[] = "text/plain";
+const char my_wrap_body[] = "Tekstdokument";
+
 struct my_wrap_data {
 	struct my_ngtcp2_ctx *ngtcp2_ctx;
 	struct my_nghttp3_ctx *nghttp3_ctx;
 };
 
-int my_wrap_submit_request (
+int my_wrap_submit_request_with_body (
 		int64_t *result,
 		struct my_wrap_data *data,
 		const char *endpoint,
-		const char *host
+		const char *host,
+		const char *content_type,
+		struct my_nghttp3_data *body_data
 ) {
 	int ret = 0;
 
@@ -28,14 +34,32 @@ int my_wrap_submit_request (
 		goto out;
 	}
 
-	if ((ret = my_nghttp3_submit_request(data->nghttp3_ctx, stream_id, endpoint, host)) != 0) {
-		goto out;
+	if (body_data) {
+		assert(body_data->data != NULL);
+		assert(content_type != NULL);
+		if ((ret = my_nghttp3_submit_request_with_body(data->nghttp3_ctx, stream_id, endpoint, host, "POST", content_type, body_data)) != 0) {
+			goto out;
+		}
+	}
+	else {
+		if ((ret = my_nghttp3_submit_request(data->nghttp3_ctx, stream_id, endpoint, host)) != 0) {
+			goto out;
+		}
 	}
 
 	*result = stream_id;
 
 	out:
 	return ret;
+}
+
+int my_wrap_submit_request (
+		int64_t *result,
+		struct my_wrap_data *data,
+		const char *endpoint,
+		const char *host
+) {
+	return my_wrap_submit_request_with_body(result, data, endpoint, host, NULL, NULL);
 }
 
 int my_wrap_cb_ready (void *arg) {
@@ -57,6 +81,16 @@ int my_wrap_cb_ready (void *arg) {
 	}
 
 	if ((ret = my_wrap_submit_request(&request_stream_id, data, SERVER_ENDPOINT, SERVER_ADDR)) != 0) {
+		goto out;
+	}
+
+	static struct my_nghttp3_data body_data = {
+		my_wrap_body,
+		sizeof(my_wrap_body) - 1,
+		0
+	};
+
+	if ((ret = my_wrap_submit_request_with_body(&request_stream_id, data, SERVER_ENDPOINT, SERVER_ADDR, my_wrap_body_content_type, &body_data)) != 0) {
 		goto out;
 	}
 
