@@ -1,3 +1,15 @@
+This is a VERY simple HTTP/3 client.
+
+To change server and endpoints, modify the code in wrap.c .
+
+As-is, the code will make one GET and one POST request to
+127.0.0.1 port 4433 to endpoint "/README.rst" after which
+the connection will be kept open by sending PING packets
+once in a while.
+
+The code may be used as a template for building other HTTP3
+clients.
+
 Requirements:
 - OpenSSL with QUIC      https://github.com/quictls/openssl
 - ngtcp2 with OpenSSL    https://github.com/ngtcp2/ngtcp2
